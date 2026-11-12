@@ -11,6 +11,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<script src="https://cdn.html.games.alexa.a2z.com/alexa-html/latest/alexa-html.js"></script>
 <script>
 (function () {
   'use strict';
@@ -309,6 +310,13 @@
   resize();
   resetGame();
   resets = 0;
+
+  // Alexaの端末上で動いているときだけ、Alexaクライアントを初期化する
+  if (window.Alexa) {
+    Alexa.create({ version: '1.1' })
+      .then(function () { /* 準備完了 */ })
+      .catch(function () { /* PCのブラウザなどAlexa以外では失敗してもそのまま動かす */ });
+  }
   window.requestAnimationFrame(loop);
 
   window.autoTetris = { stats: function () { return { lines: lines, pieces: pieces, resets: resets, mode: mode }; } };
