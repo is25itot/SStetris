@@ -17,11 +17,14 @@
   'use strict';
 
   // ---------- 設定 ----------
-  var H = 15;               // 盤面の高さ(段数)
+  var H = 15;               // 盤面の高さ(段数)。小さいほどブロックが大きくなる
   var W = 10;               // 盤面の幅(画面の縦横比に合わせて resize() で決まる)
   var MIN_W = 10, MAX_W = 40;
-  var TICK = 60;            // ロジックを進める間隔(ミリ秒)。大きいほどゆっくり
+  var TICK = 100;            // ロジックを進める間隔(ミリ秒)。大きいほどゆっくり
   var GRAVITY_TICKS = 3;    // 位置合わせ中は、何tickごとに1段落ちるか
+  var LANE_COLS = 6;        // 横6列ごとに、同時に落とせるブロックを1個まで増やす
+  var SPAWN_MIN = 5;        // 次のブロックが出るまでの間隔(tick)。最短
+  var SPAWN_MAX = 12;       // 同じく最長
   var CLEAR_MS = 450;       // 列が消えるときの点滅時間
   var OVER_MS = 1800;       // 積み上がったあと、リセットするまでの時間
   var COLORS = [null, '#27d8ee', '#f2c91a', '#a64cf0', '#35d17a', '#ee4b5a', '#3f78f0', '#f28a2a'];
@@ -66,11 +69,13 @@
   });
 
   // ---------- 状態 ----------
-  var board, piece, target, bag = [];
+  var board, active = [], bag = [];
   var mode = 'play';           // play / clearing / over
-  var timer = 0;
+  var timer = 0, spawnTimer = 0;
   var clearRows = [];
-  var lines = 0, pieces = 0, resets = 0, mismatches = 0;
+  var lines = 0, pieces = 0, resets = 0, mismatches = 0, peak = 0, collisions = 0;
+
+  function maxActive() { return Math.max(1, Math.floor(W / LANE_COLS)); }
 
   function emptyBoard() {
     var b = [], y;
@@ -118,12 +123,34 @@
     return holes * 8 + total + bumpy * 2;
   }
 
+  // 落下中のブロックが使っている横の範囲(列)。新しいブロックはここを避ける
+  function reservedColumns() {
+    var res = new Array(W).fill(false), i, c;
+    for (i = 0; i < active.length; i++) {
+      for (c = active[i].a; c <= active[i].b; c++) { res[c] = true; }
+    }
+    return res;
+  }
+
   function chooseTarget(kind) {
-    var rots = ROTS[kind], best = null;
+    var rots = ROTS[kind], best = null, res = reservedColumns();
+    // 横幅が広い盤面でも横移動が長くなりすぎないよう、狙いの近くから出現させる
+    var off = Math.floor(Math.random() * 7) - 3;
     for (var r = 0; r < rots.length; r++) {
       for (var ox = 0; ox < W; ox++) {
         var y = dropY(rots[r], ox, board);
         if (y === null) { continue; }
+
+        var sx = Math.max(0, Math.min(W - 4, ox + off));
+        if (!fits(rots[0], sx, 0)) {
+          sx = ox;
+          if (!fits(rots[0], sx, 0)) { continue; }
+        }
+        // このブロックが動く横の範囲が、ほかの落下中ブロックと重ならないか
+        var a = Math.min(sx, ox), b = Math.min(W - 1, Math.max(sx, ox) + 3), free = true, c;
+        for (c = a; c <= b; c++) { if (res[c]) { free = false; break; } }
+        if (!free) { continue; }
+
         var trial = board.map(function (row) { return row.slice(); });
         for (var i = 0; i < rots[r].length; i++) {
           trial[y + rots[r][i][1]][ox + rots[r][i][0]] = kind;
@@ -134,7 +161,9 @@
         }
         var s = badness(trial) - full * 20;   // 列が消えるなら加点
         s += Math.random() * 0.5;             // 同点のとき毎回同じにならないように
-        if (best === null || s < best.score) { best = { score: s, r: r, x: ox }; }
+        if (best === null || s < best.score) {
+          best = { score: s, r: r, x: ox, sx: sx, a: a, b: b };
+        }
       }
     }
     return best;
@@ -152,64 +181,55 @@
     return bag.pop();
   }
 
-  // 出現位置: 横幅が広い盤面でも横移動が長くなりすぎないよう、狙いの近くから出す
-  function chooseSpawnX(rots, t) {
-    var off = Math.floor(Math.random() * 7) - 3;
-    var cands = [t.x + off, t.x], i, c;
-    for (i = 0; i < cands.length; i++) {
-      c = Math.max(0, Math.min(W - 4, cands[i]));
-      if (fits(rots[0], c, 0)) { return c; }
-    }
-    for (c = 0; c < W; c++) { if (fits(rots[0], c, 0)) { return c; } }
-    return null;
-  }
-
-  function spawn() {
+  function trySpawn() {
     var kind = nextKind();
-    var rots = ROTS[kind];
-    pieces++;
     var t = chooseTarget(kind);
-    var sx = t ? chooseSpawnX(rots, t) : null;
-    if (!t || sx === null) { mode = 'over'; timer = 0; piece = null; return; }
-    piece = { kind: kind, rots: rots, r: 0, x: sx, y: 0, wait: 0 };
-    target = t;
-    mode = 'play';
+    if (!t) {
+      bag.push(kind);                          // 置けなければ、その種類は次に回す
+      if (active.length === 0) { mode = 'over'; timer = 0; }   // 何も落ちていないのに置けない=積み上がり
+      return;
+    }
+    active.push({ kind: kind, rots: ROTS[kind], r: 0, x: t.sx, y: 0, wait: 0,
+                  tr: t.r, tx: t.x, a: t.a, b: t.b });
+    pieces++;
+    if (active.length > peak) { peak = active.length; }
   }
 
-  function lockPiece() {
-    var cells = piece.rots[piece.r], i;
-    if (piece.r !== target.r || piece.x !== target.x) { mismatches++; }
+  function lockPiece(p) {
+    var cells = p.rots[p.r], i;
+    if (p.r !== p.tr || p.x !== p.tx) { mismatches++; }
+    active.splice(active.indexOf(p), 1);
     for (i = 0; i < cells.length; i++) {
-      var by = piece.y + cells[i][1];
-      if (by >= 0) { board[by][piece.x + cells[i][0]] = piece.kind; }
+      var by = p.y + cells[i][1], bx = p.x + cells[i][0];
+      if (by >= 0) {
+        if (board[by][bx]) { collisions++; }
+        board[by][bx] = p.kind;
+      }
     }
-    piece = null;
     clearRows = [];
     for (var y = 0; y < H; y++) {
       if (board[y].every(function (v) { return v; })) { clearRows.push(y); }
     }
-    if (clearRows.length) { mode = 'clearing'; timer = 0; }
-    else { spawn(); }
+    if (clearRows.length) { mode = 'clearing'; timer = 0; }   // 揃ったら、全体を止めて点滅
   }
 
-  function stepPiece() {
-    var p = piece;
+  function stepPiece(p) {
     // 回転(1回ずつ。途中で入らなければ、狙いの向きに直接切り替える)
-    if (p.r !== target.r) {
+    if (p.r !== p.tr) {
       var nr = (p.r + 1) % p.rots.length;
       if (fits(p.rots[nr], p.x, p.y)) { p.r = nr; }
-      else if (fits(p.rots[target.r], p.x, p.y)) { p.r = target.r; }
+      else if (fits(p.rots[p.tr], p.x, p.y)) { p.r = p.tr; }
     }
     // 横移動(回転と同じtickで1マス)
-    if (p.x !== target.x) {
-      var nx = p.x + (target.x > p.x ? 1 : -1);
+    if (p.x !== p.tx) {
+      var nx = p.x + (p.tx > p.x ? 1 : -1);
       if (fits(p.rots[p.r], nx, p.y)) { p.x = nx; }
     }
-    var aligned = (p.r === target.r && p.x === target.x);
+    var aligned = (p.r === p.tr && p.x === p.tx);
     p.wait++;
     if (aligned || p.wait >= GRAVITY_TICKS) {
       p.wait = 0;
-      if (fits(p.rots[p.r], p.x, p.y + 1)) { p.y++; } else { lockPiece(); }
+      if (fits(p.rots[p.r], p.x, p.y + 1)) { p.y++; } else { lockPiece(p); }
     }
   }
 
@@ -223,16 +243,26 @@
 
   function resetGame() {
     board = emptyBoard();
+    active = [];
+    clearRows = [];
+    mode = 'play';
+    spawnTimer = 0;
     resets++;
-    spawn();
   }
 
   function update() {
     if (mode === 'play') {
-      stepPiece();
+      if (active.length === 0) { spawnTimer = Math.min(spawnTimer, 0); }
+      spawnTimer--;
+      if (spawnTimer <= 0 && active.length < maxActive()) {
+        trySpawn();
+        spawnTimer = SPAWN_MIN + Math.floor(Math.random() * (SPAWN_MAX - SPAWN_MIN + 1));
+      }
+      var list = active.slice();
+      for (var i = 0; i < list.length && mode === 'play'; i++) { stepPiece(list[i]); }
     } else if (mode === 'clearing') {
       timer += TICK;
-      if (timer >= CLEAR_MS) { removeClearedRows(); spawn(); }
+      if (timer >= CLEAR_MS) { removeClearedRows(); mode = 'play'; spawnTimer = 0; }
     } else if (mode === 'over') {
       timer += TICK;
       if (timer >= OVER_MS) { resetGame(); }
@@ -301,11 +331,11 @@
       }
     }
 
-    // 落下中のブロック
-    if (piece) {
-      var cells = piece.rots[piece.r];
+    // 落下中のブロック(複数)
+    for (var k = 0; k < active.length; k++) {
+      var p = active[k], cells = p.rots[p.r];
       for (i = 0; i < cells.length; i++) {
-        drawBlock(piece.x + cells[i][0], piece.y + cells[i][1], COLORS[piece.kind]);
+        drawBlock(p.x + cells[i][0], p.y + cells[i][1], COLORS[p.kind]);
       }
     }
 
@@ -348,7 +378,24 @@
 
   window.requestAnimationFrame(loop);
 
-  window.autoTetris = { stats: function () { return { W: W, lines: lines, pieces: pieces, resets: resets, mismatches: mismatches, mode: mode }; } };
+  window.autoTetris = {
+    stats: function () {
+      return { W: W, lines: lines, pieces: pieces, resets: resets, mismatches: mismatches,
+               peak: peak, collisions: collisions, mode: mode };
+    },
+    // 動作確認用: 落下中のブロック同士・盤面と重なっていないか数える
+    overlaps: function () {
+      var seen = {}, n = 0;
+      active.forEach(function (p) {
+        p.rots[p.r].forEach(function (c) {
+          var x = p.x + c[0], y = p.y + c[1], key = x + ',' + y;
+          if (seen[key] || (y >= 0 && y < H && board[y][x])) { n++; }
+          seen[key] = true;
+        });
+      });
+      return n;
+    }
+  };
 })();
 </script>
 </body>
