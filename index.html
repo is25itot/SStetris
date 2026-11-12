@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto Tetris</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- 設定 ----------
+  var W = 10, H = 20;
+  var TICK = 45;            // ロジックを進める間隔(ミリ秒)
+  var GRAVITY_TICKS = 3;    // 位置合わせ中は、何tickごとに1段落ちるか
+  var CLEAR_MS = 450;       // 列が消えるときの点滅時間
+  var OVER_MS = 1800;       // 積み上がったあと、リセットするまでの時間
+  var COLORS = [null, '#27d8ee', '#f2c91a', '#a64cf0', '#35d17a', '#ee4b5a', '#3f78f0', '#f28a2a'];
+
+  // ---------- ブロックの形 ----------
+  var BASE = [
+    null,
+    [[0,0],[1,0],[2,0],[3,0]],  // 1: I
+    [[0,0],[1,0],[0,1],[1,1]],  // 2: O
+    [[1,0],[0,1],[1,1],[2,1]],  // 3: T
+    [[1,0],[2,0],[0,1],[1,1]],  // 4: S
+    [[0,0],[1,0],[1,1],[2,1]],  // 5: Z
+    [[0,0],[0,1],[1,1],[2,1]],  // 6: J
+    [[2,0],[0,1],[1,1],[2,1]]   // 7: L
+  ];
+
+  function normalize(cells) {
+    var mx = Infinity, my = Infinity, i;
+    for (i = 0; i < cells.length; i++) {
+      mx = Math.min(mx, cells[i][0]);
+      my = Math.min(my, cells[i][1]);
+    }
+    return cells.map(function (c) { return [c[0] - mx, c[1] - my]; })
+                .sort(function (a, b) { return a[1] - b[1] || a[0] - b[0]; });
+  }
+
+  function rotate(cells) {
+    return normalize(cells.map(function (c) { return [-c[1], c[0]]; }));
+  }
+
+  // 各ブロックの回転パターン(同じ形は除く)
+  var ROTS = BASE.map(function (cells) {
+    if (!cells) { return null; }
+    var list = [], cur = normalize(cells), i, key;
+    var seen = {};
+    for (i = 0; i < 4; i++) {
+      key = JSON.stringify(cur);
+      if (!seen[key]) { seen[key] = true; list.push(cur); }
+      cur = rotate(cur);
+    }
+    return list;
+  });
+
+  // ---------- 状態 ----------
+  var board, piece, target, bag = [];
+  var mode = 'play';           // play / clearing / over
+  var timer = 0;
+  var clearRows = [];
+  var lines = 0, pieces = 0, resets = 0;
+
+  function emptyBoard() {
+    var b = [], y;
+    for (y = 0; y < H; y++) { b.push(new Array(W + 0).fill(0)); }
+    return b;
+  }
+
+  function fits(cells, ox, oy, b) {
+    b = b || board;
+    for (var i = 0; i < cells.length; i++) {
+      var bx = ox + cells[i][0], by = oy + cells[i][1];
+      if (bx < 0 || bx >= W || by >= H) { return false; }
+      if (by >= 0 && b[by][bx]) { return false; }
+    }
+    return true;
+  }
+
+  function dropY(cells, ox, b) {
+    if (!fits(cells, ox, 0, b)) { return null; }
+    var y = 0;
+    while (fits(cells, ox, y + 1, b)) { y++; }
+    return y;
+  }
+
+  // ---------- 自動プレイの考え方 ----------
+  // 盤面の悪さを点数にする(小さいほど良い): 穴・高さ・凸凹を嫌う
+  function badness(b) {
+    var heights = [], holes = 0, x, y, h;
+    for (x = 0; x < W; x++) {
+      h = 0;
+      for (y = 0; y < H; y++) {
+        if (b[y][x]) {
+          h = H - y;
+          for (var yy = y + 1; yy < H; yy++) { if (!b[yy][x]) { holes++; } }
+          break;
+        }
+      }
+      heights.push(h);
+    }
+    var bumpy = 0, total = 0;
+    for (x = 0; x < W; x++) {
+      total += heights[x];
+      if (x < W - 1) { bumpy += Math.abs(heights[x] - heights[x + 1]); }
+    }
+    return holes * 8 + total + bumpy * 2;
+  }
+
+  function chooseTarget(kind) {
+    var rots = ROTS[kind], best = null;
+    for (var r = 0; r < rots.length; r++) {
+      for (var ox = 0; ox < W; ox++) {
+        var y = dropY(rots[r], ox, board);
+        if (y === null) { continue; }
+        var trial = board.map(function (row) { return row.slice(); });
+        for (var i = 0; i < rots[r].length; i++) {
+          trial[y + rots[r][i][1]][ox + rots[r][i][0]] = kind;
+        }
+        var full = 0;
+        for (var yy = 0; yy < H; yy++) {
+          if (trial[yy].every(function (v) { return v; })) { full++; }
+        }
+        var s = badness(trial) - full * 20;   // 列が消えるなら加点
+        s += Math.random() * 0.5;             // 同点のとき毎回同じにならないように
+        if (best === null || s < best.score) { best = { score: s, r: r, x: ox }; }
+      }
+    }
+    return best;
+  }
+
+  // ---------- ブロックの出現と移動 ----------
+  function nextKind() {
+    if (bag.length === 0) {
+      bag = [1, 2, 3, 4, 5, 6, 7];
+      for (var i = bag.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var t = bag[i]; bag[i] = bag[j]; bag[j] = t;
+      }
+    }
+    return bag.pop();
+  }
+
+  function spawn() {
+    var kind = nextKind();
+    piece = { kind: kind, rots: ROTS[kind], r: 0, x: 3, y: 0, wait: 0 };
+    pieces++;
+    var t = fits(piece.rots[0], piece.x, piece.y) ? chooseTarget(kind) : null;
+    if (!t) { mode = 'over'; timer = 0; piece = null; return; }
+    target = t;
+    mode = 'play';
+  }
+
+  function lockPiece() {
+    var cells = piece.rots[piece.r], i;
+    for (i = 0; i < cells.length; i++) {
+      var by = piece.y + cells[i][1];
+      if (by >= 0) { board[by][piece.x + cells[i][0]] = piece.kind; }
+    }
+    piece = null;
+    clearRows = [];
+    for (var y = 0; y < H; y++) {
+      if (board[y].every(function (v) { return v; })) { clearRows.push(y); }
+    }
+    if (clearRows.length) { mode = 'clearing'; timer = 0; }
+    else { spawn(); }
+  }
+
+  function stepPiece() {
+    var p = piece, cells;
+    if (p.r !== target.r) {
+      var nr = (p.r + 1) % p.rots.length;
+      if (fits(p.rots[nr], p.x, p.y)) { p.r = nr; }
+    } else if (p.x !== target.x) {
+      var nx = p.x + (target.x > p.x ? 1 : -1);
+      if (fits(p.rots[p.r], nx, p.y)) { p.x = nx; }
+    }
+    var aligned = (p.r === target.r && p.x === target.x);
+    p.wait++;
+    if (aligned || p.wait >= GRAVITY_TICKS) {
+      p.wait = 0;
+      cells = p.rots[p.r];
+      if (fits(cells, p.x, p.y + 1)) { p.y++; } else { lockPiece(); }
+    }
+  }
+
+  function removeClearedRows() {
+    var keep = board.filter(function (row, y) { return clearRows.indexOf(y) < 0; });
+    while (keep.length < H) { keep.unshift(new Array(W).fill(0)); }
+    board = keep;
+    lines += clearRows.length;
+    clearRows = [];
+  }
+
+  function resetGame() {
+    board = emptyBoard();
+    resets++;
+    spawn();
+  }
+
+  function update() {
+    if (mode === 'play') {
+      stepPiece();
+    } else if (mode === 'clearing') {
+      timer += TICK;
+      if (timer >= CLEAR_MS) { removeClearedRows(); spawn(); }
+    } else if (mode === 'over') {
+      timer += TICK;
+      if (timer >= OVER_MS) { resetGame(); }
+    }
+  }
+
+  // ---------- 描画 ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var cw = 0, ch = 0, cell = 0, ox0 = 0, oy0 = 0;
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cw = canvas.width = Math.floor(window.innerWidth * dpr);
+    ch = canvas.height = Math.floor(window.innerHeight * dpr);
+    cell = Math.floor(Math.min(cw * 0.9 / W, ch * 0.94 / H));
+    ox0 = Math.floor((cw - cell * W) / 2);
+    oy0 = Math.floor((ch - cell * H) / 2);
+  }
+
+  function drawBlock(x, y, color) {
+    var px = ox0 + x * cell, py = oy0 + y * cell, g = Math.max(1, Math.floor(cell * 0.06));
+    ctx.fillStyle = color;
+    ctx.fillRect(px + g, py + g, cell - g * 2, cell - g * 2);
+    // 上と左を少し明るく、下と右を少し暗くして立体感を出す
+    var e = Math.max(2, Math.floor(cell * 0.12));
+    ctx.fillStyle = 'rgba(255,255,255,0.28)';
+    ctx.fillRect(px + g, py + g, cell - g * 2, e);
+    ctx.fillRect(px + g, py + g, e, cell - g * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.fillRect(px + g, py + cell - g - e, cell - g * 2, e);
+    ctx.fillRect(px + cell - g - e, py + g, e, cell - g * 2);
+  }
+
+  function render() {
+    var x, y, i;
+    ctx.fillStyle = '#05060a';
+    ctx.fillRect(0, 0, cw, ch);
+
+    // 盤面の背景と、ごく薄い格子
+    ctx.fillStyle = '#0c0e16';
+    ctx.fillRect(ox0, oy0, cell * W, cell * H);
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (x = 1; x < W; x++) { ctx.moveTo(ox0 + x * cell + 0.5, oy0); ctx.lineTo(ox0 + x * cell + 0.5, oy0 + cell * H); }
+    for (y = 1; y < H; y++) { ctx.moveTo(ox0, oy0 + y * cell + 0.5); ctx.lineTo(ox0 + cell * W, oy0 + y * cell + 0.5); }
+    ctx.stroke();
+
+    // 積まれたブロック
+    var flashOn = (mode === 'clearing') && (Math.floor(timer / 90) % 2 === 0);
+    for (y = 0; y < H; y++) {
+      var clearing = (mode === 'clearing') && clearRows.indexOf(y) >= 0;
+      for (x = 0; x < W; x++) {
+        if (board[y][x]) {
+          drawBlock(x, y, (clearing && flashOn) ? '#ffffff' : COLORS[board[y][x]]);
+        }
+      }
+    }
+
+    // 落下中のブロック
+    if (piece) {
+      var cells = piece.rots[piece.r];
+      for (i = 0; i < cells.length; i++) {
+        drawBlock(piece.x + cells[i][0], piece.y + cells[i][1], COLORS[piece.kind]);
+      }
+    }
+
+    // 積み上がったら、暗くしてからリセット
+    if (mode === 'over') {
+      ctx.fillStyle = 'rgba(5,6,10,' + Math.min(0.85, timer / OVER_MS) + ')';
+      ctx.fillRect(ox0, oy0, cell * W, cell * H);
+    }
+
+    // 消した列の数(盤面のすぐ右に小さく)
+    var fs = Math.max(12, Math.floor(cell * 0.7));
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = fs + 'px sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText(String(lines), ox0 + cell * W + Math.floor(cell * 0.6), oy0);
+  }
+
+  // ---------- メインループ ----------
+  var last = 0, acc = 0;
+  function loop(now) {
+    var dt = last ? Math.min(now - last, 250) : 0;
+    last = now;
+    acc += dt;
+    while (acc >= TICK) { update(); acc -= TICK; }
+    render();
+    window.requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+  resetGame();
+  resets = 0;
+  window.requestAnimationFrame(loop);
+
+  window.autoTetris = { stats: function () { return { lines: lines, pieces: pieces, resets: resets, mode: mode }; } };
+})();
+</script>
+</body>
+</html>
